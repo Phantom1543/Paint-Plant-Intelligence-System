@@ -1,0 +1,291 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DHT.h>
+
+// ========== PIN CONFIGURATION ==========
+#define DHT_PIN       4
+#define DHT_TYPE      DHT11
+#define MQ135_PIN     15
+#define GREEN_LED     18
+#define RED_LED       19
+#define BUZZER        21
+
+// ========== OBJECTS ==========
+DHT dht(DHT_PIN, DHT_TYPE);
+WebServer server(80);
+
+// ========== WIFI ACCESS POINT ==========
+const char* WIFI_NAME = "PaintPlant_Monitor";
+const char* WIFI_PASS = "12345678";
+
+// ========== SAFETY LIMITS ==========
+const float TEMP_LIMIT = 40.0;
+const float HUMIDITY_LIMIT = 85.0;
+
+// ========== SENSOR VARIABLES ==========
+float temperature = NAN;
+float humidity = NAN;
+
+bool gasDetected = false;
+bool tempHazard = false;
+bool humidityHazard = false;
+bool gasHazard = false;
+bool hazard = false;
+bool dhtValid = false;
+
+unsigned long lastSensorRead = 0;
+unsigned long lastBuzzer = 0;
+bool buzzerState = false;
+
+// ========== READ SENSORS ==========
+void readSensors() {
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+
+  dhtValid = !isnan(t) && !isnan(h);
+
+  if (dhtValid) {
+    temperature = t;
+    humidity = h;
+  }
+
+  // Most MQ-135 comparator modules pull DO LOW
+  // when the set gas threshold is exceeded.
+  gasDetected = (digitalRead(MQ135_PIN) == LOW);
+}
+
+// ========== CHECK HAZARDS ==========
+void checkHazard() {
+  tempHazard = !dhtValid || temperature > TEMP_LIMIT;
+  humidityHazard = !dhtValid || humidity > HUMIDITY_LIMIT;
+  gasHazard = gasDetected;
+
+  // A failed DHT reading is treated as unsafe.
+  hazard = tempHazard || humidityHazard || gasHazard;
+}
+
+// ========== CONTROL OUTPUTS ==========
+void updateOutputs() {
+  digitalWrite(GREEN_LED, hazard ? LOW : HIGH);
+  digitalWrite(RED_LED, hazard ? HIGH : LOW);
+}
+
+// ========== BUZZER ==========
+void updateBuzzer() {
+  if (!hazard) {
+    digitalWrite(BUZZER, LOW);
+    buzzerState = false;
+    return;
+  }
+
+  if (millis() - lastBuzzer >= 500) {
+    lastBuzzer = millis();
+    buzzerState = !buzzerState;
+    digitalWrite(BUZZER, buzzerState ? HIGH : LOW);
+  }
+}
+
+// ========== SERIAL MONITOR ==========
+void printData() {
+  Serial.println("\n===== PAINT PLANT INTELLIGENCE SYSTEM =====");
+
+  Serial.print("Temperature: ");
+  if (dhtValid) {
+    Serial.print(temperature, 1);
+    Serial.println(" C");
+  } else {
+    Serial.println("SENSOR ERROR");
+  }
+
+  Serial.print("Humidity: ");
+  if (dhtValid) {
+    Serial.print(humidity, 1);
+    Serial.println(" %");
+  } else {
+    Serial.println("SENSOR ERROR");
+  }
+
+  Serial.print("Solvent Vapor / Air Quality (MQ-135): ");
+  Serial.println(gasDetected ? "GAS DETECTED" : "NORMAL");
+
+  Serial.print("System status: ");
+  Serial.println(hazard ? "HAZARD" : "SAFE");
+
+  Serial.println("===========================================");
+}
+
+// ========== WEB DASHBOARD ==========
+void handleRoot() {
+  String tempText = dhtValid ? String(temperature, 1) + " &deg;C"
+                             : "Sensor error";
+  String humidityText = dhtValid ? String(humidity, 1) + " %"
+                                 : "Sensor error";
+
+  String gasText = gasDetected ? "GAS DETECTED" : "NORMAL";
+  String statusText = hazard ? "HAZARD DETECTED" : "ENVIRONMENT SAFE";
+  String statusClass = hazard ? "danger" : "safe";
+
+  String tempStatus = !dhtValid ? "SENSOR ERROR"
+                    : tempHazard ? "HIGH" : "NORMAL";
+
+  String humidityStatus = !dhtValid ? "SENSOR ERROR"
+                         : humidityHazard ? "HIGH" : "NORMAL";
+
+  String gasStatus = gasHazard ? "GAS DETECTED" : "NORMAL";
+
+  String page = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="3">
+<title>Paint Plant Intelligence System</title>
+<style>
+body {
+  font-family: Arial, sans-serif;
+  background: #f1f5f9;
+  margin: 0;
+  padding: 20px;
+  color: #172033;
+}
+header {
+  background: #172033;
+  color: white;
+  padding: 22px;
+  border-radius: 14px;
+  text-align: center;
+  margin-bottom: 20px;
+}
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 15px;
+}
+.card, .analysis {
+  background: white;
+  padding: 22px;
+  border-radius: 14px;
+  box-shadow: 0 3px 10px #00000012;
+}
+.value {
+  font-size: 27px;
+  font-weight: bold;
+  margin: 15px 0;
+  overflow-wrap: anywhere;
+}
+.status {
+  margin: 18px 0;
+  padding: 22px;
+  border-radius: 14px;
+  text-align: center;
+  font-weight: bold;
+  font-size: 23px;
+}
+.safe { background: #d8f7df; color: #126b30; }
+.danger { background: #ffe0e0; color: #b00020; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Paint Plant Intelligence System</h1>
+  <p>Real-Time Paint Plant Safety Monitoring</p>
+</header>
+
+<div class="cards">
+  <div class="card">
+    <h2>Temperature</h2>
+    <div class="value">%TEMP%</div>
+    <p>Safety limit: 40 &deg;C</p>
+  </div>
+  <div class="card">
+    <h2>Humidity</h2>
+    <div class="value">%HUMIDITY%</div>
+    <p>Safety limit: 85%</p>
+  </div>
+  <div class="card">
+    <h2>Solvent Vapor / Air Quality</h2>
+    <div class="value">%GAS%</div>
+    <p>MQ-135 digital threshold</p>
+  </div>
+</div>
+
+<div class="status %CLASS%">%STATUS%</div>
+
+<div class="analysis">
+  <h2>Hazard Analysis</h2>
+  <p>Temperature: %TEMP_STATUS%</p>
+  <p>Humidity: %HUMIDITY_STATUS%</p>
+  <p>Solvent Vapor / Air Quality: %GAS_STATUS%</p>
+  <p>Page refreshes every 3 seconds.</p>
+</div>
+</body>
+</html>
+)rawliteral";
+
+  page.replace("%TEMP%", tempText);
+  page.replace("%HUMIDITY%", humidityText);
+  page.replace("%GAS%", gasText);
+  page.replace("%CLASS%", statusClass);
+  page.replace("%STATUS%", statusText);
+  page.replace("%TEMP_STATUS%", tempStatus);
+  page.replace("%HUMIDITY_STATUS%", humidityStatus);
+  page.replace("%GAS_STATUS%", gasStatus);
+
+  server.send(200, "text/html", page);
+}
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(MQ135_PIN, INPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(RED_LED, LOW);
+  digitalWrite(BUZZER, LOW);
+
+  dht.begin();
+
+  Serial.println("Starting Paint Plant Intelligence System...");
+
+  WiFi.mode(WIFI_AP);
+  bool apStarted = WiFi.softAP(WIFI_NAME, WIFI_PASS);
+
+  if (apStarted) {
+    Serial.println("Wi-Fi network started.");
+    Serial.print("Network: ");
+    Serial.println(WIFI_NAME);
+    Serial.print("Dashboard: http://");
+    Serial.println(WiFi.softAPIP());
+  } else {
+    Serial.println("ERROR: Wi-Fi access point failed.");
+  }
+
+  server.on("/", handleRoot);
+  server.begin();
+
+  readSensors();
+  checkHazard();
+  updateOutputs();
+  printData();
+}
+
+// ========== MAIN LOOP ==========
+void loop() {
+  server.handleClient();
+
+  if (millis() - lastSensorRead >= 2000) {
+    lastSensorRead = millis();
+
+    readSensors();
+    checkHazard();
+    updateOutputs();
+    printData();
+  }
+
+  updateBuzzer();
+}
